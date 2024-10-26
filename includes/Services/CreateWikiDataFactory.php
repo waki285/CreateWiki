@@ -242,6 +242,9 @@ class CreateWikiDataFactory {
 			$states['experimental'] = (bool)$row->wiki_experimental;
 		}
 
+		$states['deleted'] = (bool)$row->wiki_deleted;
+		$states['locked'] = (bool)$row->wiki_locked;
+
 		$cacheArray = [
 			'mtime' => $mtime,
 			'database' => $row->wiki_dbname,
@@ -285,6 +288,7 @@ class CreateWikiDataFactory {
 		if ( $tmpFile ) {
 			if ( file_put_contents( $tmpFile, "<?php\n\nreturn " . var_export( $data, true ) . ";\n" ) ) {
 				if ( !rename( $tmpFile, "{$this->cacheDir}/{$fileName}.php" ) ) {
+					chmod("{$this->cacheDir}/{$fileName}.php", 0777);
 					unlink( $tmpFile );
 				}
 			} else {
