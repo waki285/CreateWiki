@@ -7,19 +7,19 @@ use MediaWiki\Context\IContextSource;
 use MediaWiki\Languages\LanguageNameUtils;
 use MediaWiki\Linker\Linker;
 use MediaWiki\Linker\LinkRenderer;
+use MediaWiki\Pager\IndexPager;
 use MediaWiki\Pager\TablePager;
-use MediaWiki\Permissions\PermissionManager;
 use MediaWiki\SpecialPage\SpecialPage;
 use MediaWiki\User\UserFactory;
-use Miraheze\CreateWiki\ConfigNames;
+use Miraheze\CreateWiki\Services\WikiRequestManager;
 use Wikimedia\Rdbms\IConnectionProvider;
 
 class RequestWikiQueuePager extends TablePager {
 
 	private LanguageNameUtils $languageNameUtils;
 	private LinkRenderer $linkRenderer;
-	private PermissionManager $permissionManager;
 	private UserFactory $userFactory;
+	private WikiRequestManager $wikiRequestManager;
 
 	private string $dbname;
 	private string $language;
@@ -32,23 +32,28 @@ class RequestWikiQueuePager extends TablePager {
 		IConnectionProvider $connectionProvider,
 		LanguageNameUtils $languageNameUtils,
 		LinkRenderer $linkRenderer,
-		PermissionManager $permissionManager,
 		UserFactory $userFactory,
+		WikiRequestManager $wikiRequestManager,
 		string $dbname,
 		string $language,
 		string $requester,
 		string $status
 	) {
+		$this->mDb = $connectionProvider->getReplicaDatabase( 'virtual-createwiki-central' );
+
+		$this->linkRenderer = $linkRenderer;
+
+		if ( $context->getRequest()->getText( 'sort', 'cw_timestamp' ) == 'cw_timestamp' ) {
+			$this->mDefaultDirection = IndexPager::DIR_DESCENDING;
+		} else {
+			$this->mDefaultDirection = IndexPager::DIR_ASCENDING;
+		}
+
 		parent::__construct( $context, $linkRenderer );
 
-		$this->mDb = $connectionProvider->getReplicaDatabase(
-			$config->get( ConfigNames::GlobalWiki )
-		);
-
 		$this->languageNameUtils = $languageNameUtils;
-		$this->linkRenderer = $linkRenderer;
-		$this->permissionManager = $permissionManager;
 		$this->userFactory = $userFactory;
+		$this->wikiRequestManager = $wikiRequestManager;
 
 		$this->dbname = $dbname;
 		$this->language = $language;
@@ -122,9 +127,10 @@ class RequestWikiQueuePager extends TablePager {
 
 	/** @inheritDoc */
 	public function getQueryInfo(): array {
+		$dbr = $this->getDatabase();
 		$user = $this->getUser();
 
-		$visibility = $this->permissionManager->userHasRight( $user, 'createwiki' ) ? 1 : 0;
+		$allowedVisibilities = $this->wikiRequestManager->getAllowedVisibilities( $user );
 
 		$info = [
 			'tables' => [
@@ -141,7 +147,7 @@ class RequestWikiQueuePager extends TablePager {
 				'cw_sitename',
 			],
 			'conds' => [
-				'cw_visibility <= ' . $visibility,
+				$dbr->expr( 'cw_visibility', '=', $allowedVisibilities ),
 			],
 			'joins_conds' => [],
 		];
@@ -169,7 +175,7 @@ class RequestWikiQueuePager extends TablePager {
 
 	/** @inheritDoc */
 	public function getDefaultSort(): string {
-		return 'cw_id';
+		return 'cw_timestamp';
 	}
 
 	/** @inheritDoc */

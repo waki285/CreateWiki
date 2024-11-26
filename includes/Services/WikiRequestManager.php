@@ -17,6 +17,7 @@ use MediaWiki\User\UserIdentity;
 use Miraheze\CreateWiki\ConfigNames;
 use Miraheze\CreateWiki\Jobs\CreateWikiJob;
 use Miraheze\CreateWiki\Jobs\RequestWikiAIJob;
+use Miraheze\CreateWiki\Jobs\RequestWikiRemoteAIJob;
 use RuntimeException;
 use stdClass;
 use Wikimedia\Rdbms\IConnectionProvider;
@@ -30,7 +31,8 @@ class WikiRequestManager {
 		ConfigNames::AIThreshold,
 		ConfigNames::Categories,
 		ConfigNames::DatabaseSuffix,
-		ConfigNames::GlobalWiki,
+		ConfigNames::OpenAIConfig,
+		ConfigNames::Purposes,
 		ConfigNames::Subdomain,
 		ConfigNames::UseJobQueue,
 	];
@@ -91,9 +93,7 @@ class WikiRequestManager {
 	}
 
 	public function loadFromID( int $requestID ): void {
-		$this->dbw = $this->connectionProvider->getPrimaryDatabase(
-			$this->options->get( ConfigNames::GlobalWiki )
-		);
+		$this->dbw = $this->connectionProvider->getPrimaryDatabase( 'virtual-createwiki-central' );
 
 		$this->ID = $requestID;
 
@@ -107,6 +107,87 @@ class WikiRequestManager {
 
 	public function exists(): bool {
 		return (bool)$this->row;
+	}
+
+	public function createNewRequestAndLog(
+		array $data,
+		array $extraData,
+		User $user
+	): void {
+		$this->dbw = $this->connectionProvider->getPrimaryDatabase( 'virtual-createwiki-central' );
+
+		$subdomain = strtolower( $data['subdomain'] );
+		$dbname = $subdomain . $this->options->get( ConfigNames::DatabaseSuffix );
+		$url = $subdomain . '.' . $this->options->get( ConfigNames::Subdomain );
+
+		$comment = $data['reason'];
+		if ( $this->options->get( ConfigNames::Purposes ) && ( $data['purpose'] ?? '' ) ) {
+			$comment = implode( "\n", [ 'Purpose: ' . $data['purpose'], $data['reason'] ] );
+		}
+
+		$jsonExtra = json_encode( $extraData );
+		if ( $jsonExtra === false ) {
+			throw new RuntimeException( 'Can not set invalid JSON data to cw_extra.' );
+		}
+
+		$this->dbw->newInsertQueryBuilder()
+			->insertInto( 'cw_requests' )
+			->ignore()
+			->row( [
+				'cw_comment' => $comment,
+				'cw_dbname' => $dbname,
+				'cw_language' => $data['language'],
+				'cw_private' => $data['private'] ?? 0,
+				'cw_status' => 'inreview',
+				'cw_sitename' => $data['sitename'],
+				'cw_timestamp' => $this->dbw->timestamp(),
+				'cw_url' => $url,
+				'cw_user' => $user->getId(),
+				'cw_category' => $data['category'] ?? '',
+				'cw_visibility' => 0,
+				'cw_bio' => $data['bio'] ?? 0,
+				'cw_extra' => $jsonExtra,
+			] )
+			->caller( __METHOD__ )
+			->execute();
+
+		$this->ID = $this->dbw->insertId();
+
+		if ( $this->options->get( ConfigNames::AIThreshold ) > 0 ) {
+			$this->tryAutoCreate( $data['reason'] );
+		} elseif (
+			$this->options->get( ConfigNames::OpenAIConfig )['apikey'] &&
+			$this->options->get( ConfigNames::OpenAIConfig )['assistantid']
+		) {
+			$this->evaluateWithOpenAI( $data['sitename'],
+			$data['subdomain'],
+			$data['reason'],
+			$user->getName(),
+			$data['language'],
+			$data['bio'],
+			$data['private'] ?? 0,
+			$data['category'] ?? '',
+			$extraData['nsfw'] ?? 0,
+			$extraData['nsfwtext'] ?? ''
+			);
+		}
+
+		$this->logNewRequest( $data, $user );
+	}
+
+	public function isDuplicateRequest( string $sitename ): bool {
+		$dbw = $this->connectionProvider->getPrimaryDatabase( 'virtual-createwiki-central' );
+		$duplicate = $dbw->newSelectQueryBuilder()
+			->table( 'cw_requests' )
+			->field( '*' )
+			->where( [
+				'cw_sitename' => $sitename,
+				'cw_status' => 'inreview',
+			] )
+			->caller( __METHOD__ )
+			->fetchRow();
+
+		return (bool)$duplicate;
 	}
 
 	public function addComment(
@@ -152,7 +233,7 @@ class WikiRequestManager {
 			->table( 'cw_comments' )
 			->field( '*' )
 			->where( [ 'cw_id' => $this->ID ] )
-			->orderBy( 'cw_comment_timestamp', SelectQueryBuilder::SORT_DESC )
+			->orderBy( 'cw_comment_timestamp', SelectQueryBuilder::SORT_ASC )
 			->caller( __METHOD__ )
 			->fetchResultSet();
 
@@ -252,9 +333,7 @@ class WikiRequestManager {
 		User $requester,
 		UserIdentity $user
 	): array {
-		$dbr = $this->connectionProvider->getReplicaDatabase(
-			$this->options->get( ConfigNames::GlobalWiki )
-		);
+		$dbr = $this->connectionProvider->getReplicaDatabase( 'virtual-createwiki-central' );
 
 		$userID = $requester->getId();
 		$res = $dbr->newSelectQueryBuilder()
@@ -303,6 +382,18 @@ class WikiRequestManager {
 		);
 	}
 
+	public function getAllowedVisibilities( UserIdentity $user ): array {
+		$allowedVisibilities = [];
+
+		foreach ( self::VISIBILITY_CONDS as $visibility => $condition ) {
+			if ( $this->isVisibilityAllowed( $visibility, $user ) ) {
+				$allowedVisibilities[] = $visibility;
+			}
+		}
+
+		return $allowedVisibilities;
+	}
+
 	public function approve( UserIdentity $user, string $comment ): void {
 		if ( $this->getStatus() === 'approved' ) {
 			return;
@@ -341,7 +432,7 @@ class WikiRequestManager {
 			$this->log( $user, 'requestapprove' );
 
 			if ( $this->options->get( ConfigNames::AIThreshold ) === 0 ) {
-				$this->tryAutoCreate();
+				$this->tryAutoCreate( $this->getReason() );
 			}
 		} else {
 			$wikiManager = $this->wikiManagerFactory->newInstance( $this->getDBname() );
@@ -405,7 +496,7 @@ class WikiRequestManager {
 		$this->log( $user, 'requestdecline' );
 
 		if ( $this->options->get( ConfigNames::AIThreshold ) === 0 ) {
-			$this->tryAutoCreate();
+			$this->tryAutoCreate( $this->getReason() );
 		}
 	}
 
@@ -488,7 +579,34 @@ class WikiRequestManager {
 		$logEntry->publish( $logID );
 	}
 
-	private function suppressionLog( UserIdentity $user, string $action ): void {
+	private function logNewRequest(
+		array $data,
+		UserIdentity $user
+	): void {
+		$requestWikiLink = SpecialPage::getTitleValueFor( 'RequestWiki' );
+		$logEntry = new ManualLogEntry( 'farmer', 'requestwiki' );
+
+		$logEntry->setPerformer( $user );
+		$logEntry->setTarget( $requestWikiLink );
+		$logEntry->setComment( $data['reason'] );
+
+		$logEntry->setParameters(
+			[
+				'4::sitename' => $data['sitename'],
+				'5::language' => $data['language'],
+				'6::private' => (int)( $data['private'] ?? 0 ),
+				'7::id' => "#{$this->ID}",
+			]
+		);
+
+		$logID = $logEntry->insert( $this->dbw );
+		$logEntry->publish( $logID );
+	}
+
+	private function logSuppression(
+		UserIdentity $user,
+		string $action
+	): void {
 		$requestQueueLink = SpecialPage::getTitleValueFor( 'RequestWikiQueue', (string)$this->ID );
 		$requestLink = $this->linkRenderer->makeLink( $requestQueueLink, "#{$this->ID}" );
 
@@ -522,15 +640,15 @@ class WikiRequestManager {
 		if ( $log ) {
 			switch ( $level ) {
 				case self::VISIBILITY_PUBLIC:
-					$this->suppressionLog( $user, 'public' );
+					$this->logSuppression( $user, 'public' );
 					break;
 
 				case self::VISIBILITY_DELETE_REQUEST:
-					$this->suppressionLog( $user, 'delete' );
+					$this->logSuppression( $user, 'delete' );
 					break;
 
 				case self::VISIBILITY_SUPPRESS_REQUEST:
-					$this->suppressionLog( $user, 'suppress' );
+					$this->logSuppression( $user, 'suppress' );
 					break;
 			}
 		}
@@ -545,7 +663,7 @@ class WikiRequestManager {
 	}
 
 	public function getID(): int {
-		return $this->row->cw_id;
+		return $this->ID;
 	}
 
 	public function getDBname(): string {
@@ -851,14 +969,47 @@ class WikiRequestManager {
 		return implode( "\n", $lines );
 	}
 
-	public function tryAutoCreate(): void {
+	private function tryAutoCreate( string $reason ): void {
 		$jobQueueGroup = $this->jobQueueGroupFactory->makeJobQueueGroup();
 		$jobQueueGroup->push(
 			new JobSpecification(
 				RequestWikiAIJob::JOB_NAME,
 				[
 					'id' => $this->ID,
-					'reason' => $this->getReason(),
+					'reason' => $reason,
+				]
+			)
+		);
+	}
+
+	private function evaluateWithOpenAI(
+		string $sitename,
+		string $subdomain,
+		string $reason,
+		string $username,
+		string $language,
+		bool $bio,
+		bool $private,
+		string $category,
+		bool $nsfw,
+		string $nsfwtext
+	): void {
+		$jobQueueGroup = $this->jobQueueGroupFactory->makeJobQueueGroup();
+		$jobQueueGroup->push(
+			new JobSpecification(
+				RequestWikiRemoteAIJob::JOB_NAME,
+				[
+					'id' => $this->ID,
+					'sitename' => $sitename,
+					'subdomain' => $subdomain,
+					'reason' => $reason,
+					'username' => $username,
+					'language' => $language,
+					'bio' => $bio,
+					'private' => $private,
+					'category' => $category,
+					'nsfw' => $nsfw,
+					'nsfwtext' => $nsfwtext
 				]
 			)
 		);

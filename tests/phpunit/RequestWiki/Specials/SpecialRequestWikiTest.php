@@ -1,11 +1,12 @@
 <?php
 
-namespace Miraheze\CreateWiki\Tests\RequestWiki;
+namespace Miraheze\CreateWiki\Tests\RequestWiki\Specials;
 
 use ErrorPageError;
 use Generator;
 use MediaWiki\Context\DerivativeContext;
 use MediaWiki\Context\RequestContext;
+use MediaWiki\MainConfigNames;
 use MediaWiki\Permissions\Authority;
 use MediaWiki\Request\FauxRequest;
 use MediaWiki\Request\WebRequest;
@@ -15,7 +16,7 @@ use MediaWiki\User\User;
 use MediaWiki\WikiMap\WikiMap;
 use Miraheze\CreateWiki\ConfigNames;
 use Miraheze\CreateWiki\Hooks\CreateWikiHookRunner;
-use Miraheze\CreateWiki\RequestWiki\SpecialRequestWiki;
+use Miraheze\CreateWiki\RequestWiki\Specials\SpecialRequestWiki;
 use SpecialPageTestBase;
 use UserNotLoggedIn;
 use Wikimedia\TestingAccessWrapper;
@@ -24,7 +25,7 @@ use Wikimedia\TestingAccessWrapper;
  * @group CreateWiki
  * @group Database
  * @group medium
- * @coversDefaultClass \Miraheze\CreateWiki\RequestWiki\SpecialRequestWiki
+ * @coversDefaultClass \Miraheze\CreateWiki\RequestWiki\Specials\SpecialRequestWiki
  */
 class SpecialRequestWikiTest extends SpecialPageTestBase {
 
@@ -38,8 +39,9 @@ class SpecialRequestWikiTest extends SpecialPageTestBase {
 	protected function newSpecialPage(): SpecialRequestWiki {
 		$services = $this->getServiceContainer();
 		return new SpecialRequestWiki(
-			$services->getConnectionProvider(),
-			$this->createMock( CreateWikiHookRunner::class )
+			$services->get( 'CreateWikiDatabaseUtils' ),
+			$this->createMock( CreateWikiHookRunner::class ),
+			$services->get( 'WikiRequestManager' )
 		);
 	}
 
@@ -49,9 +51,9 @@ class SpecialRequestWikiTest extends SpecialPageTestBase {
 		// T12639
 		$this->disableAutoCreateTempUser();
 
-		$this->overrideConfigValue(
-			ConfigNames::GlobalWiki, WikiMap::getCurrentWikiId()
-		);
+		$this->overrideConfigValue( MainConfigNames::VirtualDomainsMapping, [
+				'virtual-createwiki-central' => [ 'db' => WikiMap::getCurrentWikiId() ],
+		] );
 
 		$this->specialRequestWiki = $this->newSpecialPage();
 	}
