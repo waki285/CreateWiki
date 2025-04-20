@@ -2,13 +2,13 @@ name: Call reusable MediaWiki tests
 
 on:
   push:
-    branches: [ master ]
+    branches: [ main ]
   pull_request:
-    branches: [ master ]
+    branches: [ main ]
 
 jobs:
   call-mediawiki-tests-workflow:
-    uses: miraheze/.github/.github/workflows/mediawiki-tests.yml@master
+    uses: miraheze/.github/.github/workflows/mediawiki-tests.yml@main
     strategy:
       matrix:
         include:
@@ -16,7 +16,8 @@ jobs:
           - mw: 'REL1_43'
             php: 8.1
             php-docker: 81
-            composer-test: false
+            composer-test: true
+            coverage: true
             experimental: false
 
           # Latest MediaWiki master - PHP 8.1
@@ -24,6 +25,7 @@ jobs:
             php: 8.1
             php-docker: 81
             composer-test: false
+            coverage: false
             experimental: true
 
     with:
@@ -32,13 +34,14 @@ jobs:
       php-docker: ${{ matrix.php-docker }}
       experimental: ${{ matrix.experimental }}
       composer-test: ${{ matrix.composer-test }}
+      coverage: ${{ matrix.coverage }}
 
     secrets: inherit
 
   notify-irc:
     needs: call-mediawiki-tests-workflow
     runs-on: ubuntu-latest
-    if: ${{ always() && github.repository_owner == 'miraheze' && ( github.ref == 'refs/heads/master' || github.event_name == 'pull_request' ) }}
+    if: ${{ always() && github.repository_owner == 'miraheze' && ( github.ref == 'refs/heads/main' || github.event_name == 'pull_request' ) }}
     steps:
       - name: succeeded
         uses: technote-space/workflow-conclusion-action@v3

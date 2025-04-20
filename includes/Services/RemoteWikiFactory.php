@@ -8,12 +8,12 @@ use MediaWiki\JobQueue\JobQueueGroupFactory;
 use Miraheze\CreateWiki\ConfigNames;
 use Miraheze\CreateWiki\Exceptions\MissingWikiError;
 use Miraheze\CreateWiki\Hooks\CreateWikiHookRunner;
+use Miraheze\CreateWiki\IConfigModule;
 use Miraheze\CreateWiki\Jobs\SetContainersAccessJob;
 use UnexpectedValueException;
-use Wikimedia\Rdbms\IConnectionProvider;
 use Wikimedia\Rdbms\IReadableDatabase;
 
-class RemoteWikiFactory {
+class RemoteWikiFactory implements IConfigModule {
 
 	public const CONSTRUCTOR_OPTIONS = [
 		ConfigNames::UseClosedWikis,
@@ -22,19 +22,13 @@ class RemoteWikiFactory {
 		ConfigNames::UsePrivateWikis,
 	];
 
-	private CreateWikiDataFactory $dataFactory;
-	private CreateWikiHookRunner $hookRunner;
-
-	private IConnectionProvider $connectionProvider;
 	private IReadableDatabase $dbr;
-
-	private JobQueueGroupFactory $jobQueueGroupFactory;
-	private ServiceOptions $options;
 
 	private array $changes = [];
 	private array $logParams = [];
 	private array $newRows = [];
 	private array $hooks = [];
+	private array $extra;
 
 	private string $dbname;
 	private string $sitename;
@@ -52,6 +46,7 @@ class RemoteWikiFactory {
 	private bool $inactive = false;
 	private bool $inactiveExempt = false;
 	private bool $experimental = false;
+	private bool $resetDatabaseLists = true;
 	private ?string $inactiveExemptReason = null;
 
 	private ?string $deletedTimestamp;
@@ -61,24 +56,17 @@ class RemoteWikiFactory {
 	private ?string $log = null;
 
 	public function __construct(
-		IConnectionProvider $connectionProvider,
-		CreateWikiDataFactory $dataFactory,
-		CreateWikiHookRunner $hookRunner,
-		JobQueueGroupFactory $jobQueueGroupFactory,
-		ServiceOptions $options
+		private readonly CreateWikiDatabaseUtils $databaseUtils,
+		private readonly CreateWikiDataFactory $dataFactory,
+		private readonly CreateWikiHookRunner $hookRunner,
+		private readonly JobQueueGroupFactory $jobQueueGroupFactory,
+		private readonly ServiceOptions $options
 	) {
 		$options->assertRequiredOptions( self::CONSTRUCTOR_OPTIONS );
-
-		$this->dataFactory = $dataFactory;
-		$this->connectionProvider = $connectionProvider;
-		$this->hookRunner = $hookRunner;
-		$this->jobQueueGroupFactory = $jobQueueGroupFactory;
-		$this->options = $options;
 	}
 
 	public function newInstance( string $wiki ): self {
-		$this->dbr = $this->connectionProvider->getReplicaDatabase( 'virtual-createwiki' );
-
+		$this->dbr = $this->databaseUtils->getGlobalReplicaDB();
 		$row = $this->dbr->newSelectQueryBuilder()
 			->select( '*' )
 			->from( 'cw_wikis' )
@@ -87,8 +75,15 @@ class RemoteWikiFactory {
 			->fetchRow();
 
 		if ( !$row ) {
-			throw new MissingWikiError( 'createwiki-error-missingwiki', [ $wiki ] );
+			throw new MissingWikiError( $wiki );
 		}
+
+		$this->changes = [];
+		$this->logParams = [];
+		$this->newRows = [];
+		$this->hooks = [];
+
+		$this->log = null;
 
 		$this->dbname = $wiki;
 
@@ -103,6 +98,8 @@ class RemoteWikiFactory {
 		$this->locked = (bool)$row->wiki_locked;
 
 		$this->deletedTimestamp = $row->wiki_deleted_timestamp;
+
+		$this->extra = json_decode( $row->wiki_extra ?: '[]', true );
 
 		if ( $this->options->get( ConfigNames::UsePrivateWikis ) ) {
 			$this->private = (bool)$row->wiki_private;
@@ -163,10 +160,9 @@ class RemoteWikiFactory {
 		$this->trackChange( 'inactive', 0, 1 );
 		$this->inactive = true;
 		$this->inactiveTimestamp = $this->dbr->timestamp();
-		$this->newRows += [
-			'wiki_inactive' => 1,
-			'wiki_inactive_timestamp' => $this->inactiveTimestamp,
-		];
+
+		$this->newRows['wiki_inactive'] = 1;
+		$this->newRows['wiki_inactive_timestamp'] = $this->inactiveTimestamp;
 	}
 
 	public function markActive(): void {
@@ -176,12 +172,13 @@ class RemoteWikiFactory {
 		$this->closed = false;
 		$this->closedTimestamp = null;
 		$this->inactiveTimestamp = null;
-		$this->newRows += [
+
+		$this->newRows = array_merge( $this->newRows, [
 			'wiki_closed' => 0,
 			'wiki_closed_timestamp' => null,
 			'wiki_inactive' => 0,
 			'wiki_inactive_timestamp' => null,
-		];
+		] );
 	}
 
 	public function getInactiveTimestamp(): ?string {
@@ -208,7 +205,7 @@ class RemoteWikiFactory {
 	}
 
 	public function setInactiveExemptReason( string $reason ): void {
-		$reason = ( $reason === '' ) ? null : $reason;
+		$reason = $reason === '' ? null : $reason;
 
 		$this->trackChange( 'inactive-exempt-reason', $this->inactiveExemptReason, $reason );
 
@@ -226,9 +223,9 @@ class RemoteWikiFactory {
 
 	public function markPrivate(): void {
 		$this->trackChange( 'private', 0, 1 );
+		$this->hooks[] = 'CreateWikiStatePrivate';
 		$this->private = true;
 		$this->newRows['wiki_private'] = 1;
-		$this->hooks[] = 'CreateWikiStatePrivate';
 
 		$this->jobQueueGroupFactory->makeJobQueueGroup( $this->dbname )->push(
 			new JobSpecification(
@@ -240,9 +237,9 @@ class RemoteWikiFactory {
 
 	public function markPublic(): void {
 		$this->trackChange( 'public', 0, 1 );
+		$this->hooks[] = 'CreateWikiStatePublic';
 		$this->private = false;
 		$this->newRows['wiki_private'] = 0;
-		$this->hooks[] = 'CreateWikiStatePublic';
 
 		$this->jobQueueGroupFactory->makeJobQueueGroup( $this->dbname )->push(
 			new JobSpecification(
@@ -258,17 +255,18 @@ class RemoteWikiFactory {
 
 	public function markClosed(): void {
 		$this->trackChange( 'closed', 0, 1 );
+		$this->hooks[] = 'CreateWikiStateClosed';
 		$this->closed = true;
 		$this->inactive = false;
 		$this->closedTimestamp = $this->dbr->timestamp();
 		$this->inactiveTimestamp = null;
-		$this->newRows += [
+
+		$this->newRows = array_merge( $this->newRows, [
 			'wiki_closed' => 1,
 			'wiki_closed_timestamp' => $this->closedTimestamp,
 			'wiki_inactive' => 0,
 			'wiki_inactive_timestamp' => null,
-		];
-		$this->hooks[] = 'CreateWikiStateClosed';
+		] );
 	}
 
 	public function getClosedTimestamp(): ?string {
@@ -288,14 +286,15 @@ class RemoteWikiFactory {
 		$this->deletedTimestamp = $this->dbr->timestamp();
 		$this->closedTimestamp = null;
 		$this->inactiveTimestamp = null;
-		$this->newRows += [
+
+		$this->newRows = array_merge( $this->newRows, [
 			'wiki_deleted' => 1,
 			'wiki_deleted_timestamp' => $this->deletedTimestamp,
 			'wiki_closed' => 0,
 			'wiki_closed_timestamp' => null,
 			'wiki_inactive' => 0,
 			'wiki_inactive_timestamp' => null,
-		];
+		] );
 	}
 
 	public function undelete(): void {
@@ -303,10 +302,9 @@ class RemoteWikiFactory {
 		$this->log = 'undelete';
 		$this->deleted = false;
 		$this->deletedTimestamp = null;
-		$this->newRows += [
-			'wiki_deleted' => 0,
-			'wiki_deleted_timestamp' => null,
-		];
+
+		$this->newRows['wiki_deleted'] = 0;
+		$this->newRows['wiki_deleted_timestamp'] = null;
 	}
 
 	public function getDeletedTimestamp(): ?string {
@@ -346,7 +344,7 @@ class RemoteWikiFactory {
 	}
 
 	public function setServerName( string $server ): void {
-		$server = ( $server === '' ) ? null : $server;
+		$server = $server === '' ? null : $server;
 
 		$this->trackChange( 'servername', $this->url, $server );
 
@@ -380,31 +378,61 @@ class RemoteWikiFactory {
 		$this->newRows['wiki_experimental'] = 0;
 	}
 
+	public function getExtraFieldData( string $field, mixed $default ): mixed {
+		return $this->extra[$field] ?? $default;
+	}
+
+	public function setExtraFieldData( string $field, mixed $value, mixed $default ): void {
+		if ( $value === $this->getExtraFieldData( $field, $default ) ) {
+			return;
+		}
+
+		$extra = $this->extra;
+		$extra[$field] = $value;
+
+		$newExtra = json_encode( $extra );
+
+		if ( $newExtra === false ) {
+			// Can not set invalid JSON data to wiki_extra.
+			return;
+		}
+
+		$this->extra = $extra;
+		$this->trackChange( $field, $this->getExtraFieldData( $field, $default ), $value );
+		$this->newRows['wiki_extra'] = $newExtra;
+	}
+
+	public function disableResetDatabaseLists(): void {
+		$this->resetDatabaseLists = false;
+	}
+
 	public function trackChange( string $field, mixed $oldValue, mixed $newValue ): void {
 		$this->changes[$field] = [
 			'old' => $oldValue,
-			'new' => $newValue
+			'new' => $newValue,
 		];
+	}
+
+	public function getErrors(): array {
+		// This class doesn't produce errors, but the method
+		// may be called by consumers, so return an empty array.
+		return [];
 	}
 
 	public function hasChanges(): bool {
 		return (bool)$this->changes;
 	}
 
-	public function addNewRow( string $row, mixed $value ): void {
-		$this->newRows[$row] = $value;
-	}
-
 	public function setLogAction( string $action ): void {
 		$this->log = $action;
 	}
 
-	public function addLogParam( string $param, mixed $value ): void {
-		$this->logParams[$param] = $value;
+	public function getLogAction(): string {
+		return $this->log ?? 'settings';
 	}
 
-	public function getLogAction(): ?string {
-		return $this->log;
+	public function addLogParam( string $param, mixed $value ): void {
+		$this->logParams[$param] = $value;
 	}
 
 	public function getLogParams(): array {
@@ -414,8 +442,7 @@ class RemoteWikiFactory {
 	public function commit(): void {
 		if ( $this->hasChanges() ) {
 			if ( $this->newRows ) {
-				$dbw = $this->connectionProvider->getPrimaryDatabase( 'virtual-createwiki' );
-
+				$dbw = $this->databaseUtils->getGlobalPrimaryDB();
 				$dbw->newUpdateQueryBuilder()
 					->update( 'cw_wikis' )
 					->set( $this->newRows )
@@ -439,18 +466,21 @@ class RemoteWikiFactory {
 						$this->hookRunner->onCreateWikiStatePrivate( $this->dbname );
 						break;
 					default:
-						throw new UnexpectedValueException( 'Unsupported hook: ' . $hook );
+						throw new UnexpectedValueException( "Unsupported hook: $hook" );
 				}
 			}
 
 			$data = $this->dataFactory->newInstance( $this->dbname );
-			$data->resetDatabaseLists( isNewChanges: true );
+			if ( $this->resetDatabaseLists ) {
+				$data->resetDatabaseLists( isNewChanges: true );
+			}
+
 			$data->resetWikiData( isNewChanges: true );
 
 			if ( $this->log === null ) {
 				$this->log = 'settings';
 				$this->logParams = [
-					'5::changes' => implode( ', ', array_keys( $this->changes ) )
+					'5::changes' => implode( ', ', array_keys( $this->changes ) ),
 				];
 			}
 		}

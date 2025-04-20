@@ -11,7 +11,6 @@ use MediaWiki\User\UserFactory;
 use MessageLocalizer;
 use Miraheze\CreateWiki\ConfigNames;
 use UserMailer;
-use Wikimedia\Rdbms\IConnectionProvider;
 
 class CreateWikiNotificationsManager {
 
@@ -42,31 +41,15 @@ class CreateWikiNotificationsManager {
 		'wiki-rename',
 	];
 
-	private IConnectionProvider $connectionProvider;
-	private MessageLocalizer $messageLocalizer;
-	private ServiceOptions $options;
-	private UserFactory $userFactory;
 	private string $type;
 
-	/**
-	 * @param IConnectionProvider $connectionProvider
-	 * @param MessageLocalizer $messageLocalizer
-	 * @param ServiceOptions $options
-	 * @param UserFactory $userFactory
-	 */
 	public function __construct(
-		IConnectionProvider $connectionProvider,
-		MessageLocalizer $messageLocalizer,
-		ServiceOptions $options,
-		UserFactory $userFactory
+		private readonly CreateWikiDatabaseUtils $databaseUtils,
+		private readonly MessageLocalizer $messageLocalizer,
+		private readonly ServiceOptions $options,
+		private readonly UserFactory $userFactory
 	) {
 		$options->assertRequiredOptions( self::CONSTRUCTOR_OPTIONS );
-
-		$this->connectionProvider = $connectionProvider;
-		$this->messageLocalizer = $messageLocalizer;
-
-		$this->options = $options;
-		$this->userFactory = $userFactory;
 	}
 
 	/**
@@ -90,7 +73,7 @@ class CreateWikiNotificationsManager {
 	 * @param string $wiki
 	 */
 	public function notifyBureaucrats( array $data, string $wiki ): void {
-		$dbr = $this->connectionProvider->getReplicaDatabase( $wiki );
+		$dbr = $this->databaseUtils->getRemoteWikiReplicaDB( $wiki );
 
 		$bureaucrats = $dbr->newSelectQueryBuilder()
 			->select( [ 'user_email', 'user_name' ] )
@@ -165,7 +148,6 @@ class CreateWikiNotificationsManager {
 			foreach ( $receivers as $receiver ) {
 				if ( $receiver instanceof MailAddress ) {
 					$notifyEmails[] = $receiver;
-
 					continue;
 				}
 

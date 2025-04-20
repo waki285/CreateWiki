@@ -1,6 +1,6 @@
 <?php
 
-namespace Miraheze\CreateWiki\CreateWiki;
+namespace Miraheze\CreateWiki\LogFormatter;
 
 use LogEntry;
 use LogFormatter;
@@ -8,25 +8,16 @@ use MediaWiki\Linker\LinkRenderer;
 use MediaWiki\Message\Message;
 use MediaWiki\SpecialPage\SpecialPage;
 
-class CreateWikiLogFormatter extends LogFormatter {
+class FarmerLogFormatter extends LogFormatter {
 
-	private LinkRenderer $linkRenderer;
-
-	/**
-	 * @param LogEntry $entry
-	 * @param LinkRenderer $linkRenderer
-	 */
 	public function __construct(
 		LogEntry $entry,
-		LinkRenderer $linkRenderer
+		private readonly LinkRenderer $linkRenderer
 	) {
 		parent::__construct( $entry );
-		$this->linkRenderer = $linkRenderer;
 	}
 
-	/**
-	 * @inheritDoc
-	 */
+	/** @inheritDoc */
 	protected function getMessageParameters(): array {
 		$params = parent::getMessageParameters();
 		$subtype = $this->entry->getSubtype();

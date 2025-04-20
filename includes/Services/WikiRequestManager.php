@@ -20,7 +20,6 @@ use Miraheze\CreateWiki\Jobs\RequestWikiAIJob;
 use Miraheze\CreateWiki\Jobs\RequestWikiRemoteAIJob;
 use RuntimeException;
 use stdClass;
-use Wikimedia\Rdbms\IConnectionProvider;
 use Wikimedia\Rdbms\IDatabase;
 use Wikimedia\Rdbms\SelectQueryBuilder;
 use Wikimedia\Rdbms\UpdateQueryBuilder;
@@ -52,48 +51,30 @@ class WikiRequestManager {
 		self::VISIBILITY_SUPPRESS_REQUEST => 'createwiki-suppressrequest',
 	];
 
-	private ServiceOptions $options;
 	private IDatabase $dbw;
-
-	private ?UpdateQueryBuilder $queryBuilder = null;
-
-	private WikiManagerFactory $wikiManagerFactory;
-
 	private stdClass|bool $row;
-	private LinkRenderer $linkRenderer;
-	private PermissionManager $permissionManager;
-	private UserFactory $userFactory;
-	private CreateWikiNotificationsManager $notificationsManager;
-	private IConnectionProvider $connectionProvider;
-	private JobQueueGroupFactory $jobQueueGroupFactory;
 
 	private int $ID;
 	private array $changes = [];
 
+	private ?UpdateQueryBuilder $queryBuilder = null;
+
 	public function __construct(
-		IConnectionProvider $connectionProvider,
-		CreateWikiNotificationsManager $notificationsManager,
-		JobQueueGroupFactory $jobQueueGroupFactory,
-		LinkRenderer $linkRenderer,
-		PermissionManager $permissionManager,
-		UserFactory $userFactory,
-		WikiManagerFactory $wikiManagerFactory,
-		ServiceOptions $options
+		private readonly CreateWikiDatabaseUtils $databaseUtils,
+		private readonly CreateWikiNotificationsManager $notificationsManager,
+		private readonly CreateWikiValidator $validator,
+		private readonly JobQueueGroupFactory $jobQueueGroupFactory,
+		private readonly LinkRenderer $linkRenderer,
+		private readonly PermissionManager $permissionManager,
+		private readonly UserFactory $userFactory,
+		private readonly WikiManagerFactory $wikiManagerFactory,
+		private readonly ServiceOptions $options
 	) {
 		$options->assertRequiredOptions( self::CONSTRUCTOR_OPTIONS );
-
-		$this->connectionProvider = $connectionProvider;
-		$this->notificationsManager = $notificationsManager;
-		$this->jobQueueGroupFactory = $jobQueueGroupFactory;
-		$this->linkRenderer = $linkRenderer;
-		$this->permissionManager = $permissionManager;
-		$this->userFactory = $userFactory;
-		$this->wikiManagerFactory = $wikiManagerFactory;
-		$this->options = $options;
 	}
 
 	public function loadFromID( int $requestID ): void {
-		$this->dbw = $this->connectionProvider->getPrimaryDatabase( 'virtual-createwiki-central' );
+		$this->dbw = $this->databaseUtils->getCentralWikiPrimaryDB();
 
 		$this->ID = $requestID;
 
@@ -114,9 +95,10 @@ class WikiRequestManager {
 		array $extraData,
 		User $user
 	): void {
-		$this->dbw = $this->connectionProvider->getPrimaryDatabase( 'virtual-createwiki-central' );
+		$this->dbw = $this->databaseUtils->getCentralWikiPrimaryDB();
 
-		$subdomain = strtolower( $data['subdomain'] );
+		$subdomain = $this->validator->getValidSubdomain( $data['subdomain'] );
+
 		$dbname = $subdomain . $this->options->get( ConfigNames::DatabaseSuffix );
 		$url = $subdomain . '.' . $this->options->get( ConfigNames::Subdomain );
 
@@ -166,8 +148,8 @@ class WikiRequestManager {
 	}
 
 	public function isDuplicateRequest( string $sitename ): bool {
-		$dbw = $this->connectionProvider->getPrimaryDatabase( 'virtual-createwiki-central' );
-		$duplicate = $dbw->newSelectQueryBuilder()
+		$dbr = $this->databaseUtils->getCentralWikiReplicaDB();
+		$duplicate = $dbr->newSelectQueryBuilder()
 			->table( 'cw_requests' )
 			->field( '*' )
 			->where( [
@@ -323,7 +305,7 @@ class WikiRequestManager {
 		User $requester,
 		UserIdentity $user
 	): array {
-		$dbr = $this->connectionProvider->getReplicaDatabase( 'virtual-createwiki-central' );
+		$dbr = $this->databaseUtils->getCentralWikiReplicaDB();
 
 		$userID = $requester->getId();
 		$res = $dbr->newSelectQueryBuilder()
@@ -364,12 +346,6 @@ class WikiRequestManager {
 
 		// Everyone can view public requests.
 		if ( $visibility === self::VISIBILITY_PUBLIC ) {
-			return true;
-		}
-
-		// CreateWiki AI should be able to see this.
-		// Additionally, the username is reserved.
-		if ( $user->getName() === 'CreateWiki AI' ) {
 			return true;
 		}
 
@@ -432,7 +408,7 @@ class WikiRequestManager {
 			}
 		} else {
 			$wikiManager = $this->wikiManagerFactory->newInstance( $this->getDBname() );
-			// This runs checkDatabaseName and if it returns a
+			// This runs validateDatabaseName and if it returns a
 			// non-null value it is returning an error.
 			$notCreated = $wikiManager->create(
 				sitename: $this->getSitename(),
@@ -674,10 +650,6 @@ class WikiRequestManager {
 		return $this->userFactory->newFromId( $this->row->cw_user );
 	}
 
-	public function getRequesterUsername(): string {
-		return $this->userFactory->newFromId( $this->row->cw_user )->getName();
-	}
-
 	public function getStatus(): string {
 		return $this->row->cw_status;
 	}
@@ -848,10 +820,7 @@ class WikiRequestManager {
 	public function setUrl( string $url ): void {
 		$this->checkQueryBuilder();
 		if ( $url !== $this->getUrl() ) {
-			$subdomain = strtolower( $url );
-			if ( strpos( $subdomain, $this->options->get( ConfigNames::Subdomain ) ) !== false ) {
-				$subdomain = str_replace( '.' . $this->options->get( ConfigNames::Subdomain ), '', $subdomain );
-			}
+			$subdomain = $this->validator->getValidSubdomain( $url );
 
 			$dbname = $subdomain . $this->options->get( ConfigNames::DatabaseSuffix );
 			$url = $subdomain . '.' . $this->options->get( ConfigNames::Subdomain );
@@ -987,9 +956,7 @@ class WikiRequestManager {
 		$jobQueueGroup->push(
 			new JobSpecification(
 				RequestWikiRemoteAIJob::JOB_NAME,
-				[
-					'id' => $this->ID
-				]
+				[ 'id' => $this->ID ]
 			)
 		);
 	}
